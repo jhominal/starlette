@@ -391,3 +391,46 @@ def test_streaming_response_known_size(test_client_factory):
     client: TestClient = test_client_factory(app)
     response = client.get("/")
     assert response.headers["content-length"] == "10"
+
+
+async def _stream_indefinitely():
+    while True:
+        # Need a sleep for the event loop to switch to another task
+        await anyio.sleep(0)
+        yield b"chunk "
+
+
+_streaming_response = StreamingResponse(content=_stream_indefinitely())
+_file_response = FileResponse(path=__file__)
+_file_response.chunk_size = 1
+
+
+@pytest.mark.parametrize(
+    ["response", "size"],
+    [
+        pytest.param(_streaming_response, float("inf"), id="streaming"),
+        pytest.param(_file_response, os.stat(_file_response.path).st_size, id="file"),
+    ],
+)
+@pytest.mark.anyio
+async def test_streaming_response_stops_if_receiving_http_disconnect(response, size):
+    streamed = 0
+
+    disconnected = anyio.Event()
+
+    async def receive_disconnect():
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        nonlocal streamed
+        if message["type"] == "http.response.body":
+            streamed += len(message.get("body", b""))
+            # Simulate disconnection after download has started
+            if streamed >= 16:
+                disconnected.set()
+
+    with anyio.move_on_after(1) as cancel_scope:
+        await response({}, receive_disconnect, send)
+    assert not cancel_scope.cancel_called, "Content streaming should stop itself."
+    assert streamed < size, "Content should not have been fully streamed."

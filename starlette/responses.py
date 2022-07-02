@@ -346,17 +346,30 @@ class FileResponse(Response):
         if self.send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
-            async with await anyio.open_file(self.path, mode="rb") as file:
-                more_body = True
-                while more_body:
-                    chunk = await file.read(self.chunk_size)
-                    more_body = len(chunk) == self.chunk_size
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": chunk,
-                            "more_body": more_body,
-                        }
-                    )
+            disconnected = anyio.Event()
+
+            async def set_on_disconnect() -> None:
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        disconnected.set()
+                        break
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(set_on_disconnect)
+                async with await anyio.open_file(self.path, mode="rb") as file:
+                    more_body = True
+                    while more_body and not disconnected.is_set():
+                        chunk = await file.read(self.chunk_size)
+                        more_body = len(chunk) == self.chunk_size
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk,
+                                "more_body": more_body,
+                            }
+                        )
+                task_group.cancel_scope.cancel()
+
         if self.background is not None:
             await self.background()

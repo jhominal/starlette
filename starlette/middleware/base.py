@@ -25,53 +25,17 @@ class BaseHTTPMiddleware:
             await self.app(scope, receive, send)
             return
 
+        dispatch_first_phase_ended = anyio.Event()
+        streams_ready = anyio.Event()
+        request_for_next: typing.Optional[Request] = None
         response_sent = anyio.Event()
+        app_exc: typing.Optional[Exception] = None
 
         async def call_next(request: Request) -> Response:
-            app_exc: typing.Optional[Exception] = None
-            send_stream, recv_stream = anyio.create_memory_object_stream()
-
-            async def receive_or_disconnect() -> Message:
-                if response_sent.is_set():
-                    return {"type": "http.disconnect"}
-
-                async with anyio.create_task_group() as task_group:
-
-                    async def wrap(func: typing.Callable[[], typing.Awaitable[T]]) -> T:
-                        result = await func()
-                        task_group.cancel_scope.cancel()
-                        return result
-
-                    task_group.start_soon(wrap, response_sent.wait)
-                    message = await wrap(request.receive)
-
-                if response_sent.is_set():
-                    return {"type": "http.disconnect"}
-
-                return message
-
-            async def close_recv_stream_on_response_sent() -> None:
-                await response_sent.wait()
-                recv_stream.close()
-
-            async def send_no_error(message: Message) -> None:
-                try:
-                    await send_stream.send(message)
-                except anyio.BrokenResourceError:
-                    # recv_stream has been closed, i.e. response_sent has been set.
-                    return
-
-            async def coro() -> None:
-                nonlocal app_exc
-
-                async with send_stream:
-                    try:
-                        await self.app(scope, receive_or_disconnect, send_no_error)
-                    except Exception as exc:
-                        app_exc = exc
-
-            task_group.start_soon(close_recv_stream_on_response_sent)
-            task_group.start_soon(coro)
+            nonlocal request_for_next
+            request_for_next = request
+            dispatch_first_phase_ended.set()
+            await streams_ready.wait()
 
             try:
                 message = await recv_stream.receive()
@@ -101,11 +65,59 @@ class BaseHTTPMiddleware:
             response.raw_headers = message["headers"]
             return response
 
-        async with anyio.create_task_group() as task_group:
-            request = Request(scope, receive=receive)
+        async def process_dispatch(request: Request):
             response = await self.dispatch_func(request, call_next)
             await response(scope, receive, send)
+            dispatch_first_phase_ended.set()
             response_sent.set()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(process_dispatch, Request(scope, receive=receive))
+
+            await dispatch_first_phase_ended.wait()
+            if request_for_next is None:
+                return
+
+            async def receive_or_disconnect() -> Message:
+                if response_sent.is_set():
+                    return {"type": "http.disconnect"}
+
+                async with anyio.create_task_group() as task_group:
+
+                    async def wrap(func: typing.Callable[[], typing.Awaitable[T]]) -> T:
+                        result = await func()
+                        task_group.cancel_scope.cancel()
+                        return result
+
+                    task_group.start_soon(wrap, response_sent.wait)
+                    message = await wrap(request_for_next.receive)
+
+                if response_sent.is_set():
+                    return {"type": "http.disconnect"}
+
+                return message
+
+            async def close_recv_stream_on_response_sent() -> None:
+                await response_sent.wait()
+                recv_stream.close()
+
+            async def send_no_error(message: Message) -> None:
+                try:
+                    await send_stream.send(message)
+                except anyio.BrokenResourceError:
+                    # recv_stream has been closed, i.e. response_sent has been set.
+                    return
+
+            send_stream, recv_stream = anyio.create_memory_object_stream()
+            streams_ready.set()
+
+            task_group.start_soon(close_recv_stream_on_response_sent)
+
+            async with send_stream:
+                try:
+                    await self.app(scope, receive_or_disconnect, send_no_error)
+                except Exception as exc:
+                    app_exc = exc
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint

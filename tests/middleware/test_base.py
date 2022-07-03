@@ -7,8 +7,9 @@ import pytest
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import PlainTextResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, StreamingResponse, Response
 from starlette.routing import Route, WebSocketRoute
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -198,7 +199,7 @@ def test_contextvars(test_client_factory, middleware_cls: type):
     # on sync endpoints which has it's own set of peculiarities w.r.t propagating
     # contextvars (it propagates them forwards but not backwards)
     async def homepage(request):
-        assert ctxvar.get() == "set by middleware"
+        assert ctxvar.get("unset") == "set by middleware"
         ctxvar.set("set by endpoint")
         return PlainTextResponse("Homepage")
 
@@ -209,6 +210,57 @@ def test_contextvars(test_client_factory, middleware_cls: type):
     client = test_client_factory(app)
     response = client.get("/")
     assert response.status_code == 200, response.content
+
+
+class TransparentASGIMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        return await self.app(scope, receive, send)
+
+
+class TransparentBaseHTTPMiddleware(BaseHTTPMiddleware):
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        return await call_next(request)
+
+
+@pytest.mark.parametrize(
+    "middleware_cls",
+    [
+        TransparentASGIMiddleware,
+        TransparentBaseHTTPMiddleware,
+    ],
+)
+@pytest.mark.anyio
+async def test_endpoint_contextvars_available_upstream(middleware_cls: type):
+    # this has to be an async endpoint because Starlette calls run_in_threadpool
+    # on sync endpoints which has it's own set of peculiarities w.r.t propagating
+    # contextvars (it propagates them forwards but not backwards)
+    async def homepage(request):
+        ctxvar.set("set by endpoint")
+        return PlainTextResponse("Homepage")
+
+    app = Starlette(
+        middleware=[Middleware(middleware_cls)], routes=[Route("/", homepage)]
+    )
+
+    request_body_sent = False
+    scope = {"type": "http", "method": "GET", "path": "/"}
+
+    async def receive():
+        nonlocal request_body_sent
+        if not request_body_sent:
+            request_body_sent = True
+            return {"type": "http.request"}
+        await anyio.sleep_forever()
+
+    async def send(message):
+        pass
+
+    await app(scope, receive, send)
+    assert ctxvar.get("unset") == "set by endpoint"
 
 
 @pytest.mark.anyio

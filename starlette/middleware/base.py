@@ -1,3 +1,4 @@
+import contextvars
 import typing
 
 import anyio
@@ -30,10 +31,12 @@ class BaseHTTPMiddleware:
         request_for_next: typing.Optional[Request] = None
         response_sent = anyio.Event()
         app_exc: typing.Optional[Exception] = None
+        dispatch_context_copy: typing.Optional[contextvars.Context] = None
 
         async def call_next(request: Request) -> Response:
-            nonlocal request_for_next
+            nonlocal request_for_next, dispatch_context_copy
             request_for_next = request
+            dispatch_context_copy = contextvars.copy_context()
             dispatch_first_phase_ended.set()
             await streams_ready.wait()
 
@@ -66,8 +69,10 @@ class BaseHTTPMiddleware:
             return response
 
         async def process_dispatch(request: Request):
+            nonlocal dispatch_context_copy
             response = await self.dispatch_func(request, call_next)
             await response(scope, receive, send)
+            dispatch_context_copy = contextvars.copy_context()
             dispatch_first_phase_ended.set()
             response_sent.set()
 
@@ -75,6 +80,15 @@ class BaseHTTPMiddleware:
             task_group.start_soon(process_dispatch, Request(scope, receive=receive))
 
             await dispatch_first_phase_ended.wait()
+
+            # Copy contextvars updated from dispatch into the current context.
+            for context_var, dispatch_context_value in dispatch_context_copy.items():
+                try:
+                    if context_var.get() is not dispatch_context_value:
+                        context_var.set(dispatch_context_value)
+                except LookupError:
+                    context_var.set(dispatch_context_value)
+
             if request_for_next is None:
                 return
 

@@ -199,7 +199,7 @@ def test_contextvars(test_client_factory, middleware_cls: type):
     # on sync endpoints which has it's own set of peculiarities w.r.t propagating
     # contextvars (it propagates them forwards but not backwards)
     async def homepage(request):
-        assert ctxvar.get("unset") == "set by middleware"
+        assert ctxvar.get() == "set by middleware"
         ctxvar.set("set by endpoint")
         return PlainTextResponse("Homepage")
 
